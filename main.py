@@ -5,6 +5,10 @@ Hershey's Chocolate Spread Coverage Detector
 Measures what percentage of a fixed rectangular "bread area" is covered by
 Hershey's chocolate spread, using simple HSV color segmentation (no ML).
 
+Flow:
+    intro.mp4 (plays once) -> Home screen (10.png + clickable title) ->
+    Live camera -> capture/retake/calibrate loop
+
 Run:
     python main.py
 
@@ -16,11 +20,6 @@ import os
 
 import cv2
 import numpy as np
-
-try:
-    import pygame
-except ImportError:
-    pygame = None
 
 # =============================================================================
 # CONFIGURATION - tweak these to match your setup
@@ -52,18 +51,27 @@ MORPH_CLOSE_ITERATIONS = 2
 # --- Optional uniformity metric ---
 UNIFORMITY_GRID = 4  # splits the bread area into a 4x4 grid of cells
 
-# --- "Perfect coverage" audio alert ---
-PERFECT_COVERAGE_THRESHOLD = 90.0   # percent; play the sound at/above this
-PERFECT_SOUND_FILE = "perfect.mp3"  # must sit next to this script (or give a full path)
-
-# --- Coverage-tier rating image ---
-# Checked top-down; first (threshold, filename) whose threshold the coverage
+# --- Coverage tiers: each tier has a rating image AND a sound that plays once
+# when that tier is shown. Checked top-down; first threshold the coverage
 # meets or exceeds wins. Must end with a 0 entry so every percentage matches.
 TIER_IMAGES = [
     (85.0, "1.png"),   # 85-100%
     (50.0, "2.png"),   # 50-84.999...%
     (0.0, "3.png"),    # 0-49.999...%
 ]
+
+TIER_SOUNDS = {
+    "1.png": "perfect.mp3",
+    "2.png": "mid.mp3",
+    "3.png": "bad.mp3",
+}
+
+# --- Intro video (plays once, before the home screen) ---
+INTRO_VIDEO_FILE = "intro.mp4"
+
+# --- Home screen ---
+HOME_IMAGE_FILE = "10.png"
+HOME_TITLE_TEXT = "CHECK YOUR SPREAD"
 
 # =============================================================================
 # CONFIG PERSISTENCE
@@ -93,56 +101,88 @@ def save_config(config):
 
 
 # =============================================================================
-# AUDIO ALERT
+# AUDIO ALERT (per-tier sounds: bad.mp3 / mid.mp3 / perfect.mp3)
 # =============================================================================
 
-# Resolve perfect.mp3 relative to this script's own folder, not the process's
-# current working directory - so it's found no matter where you run `python`
-# from.
+# Resolve sound files relative to this script's own folder, not the process's
+# current working directory - so they're found no matter where you run
+# `python` from.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_PERFECT_SOUND_PATH = os.path.join(_SCRIPT_DIR, PERFECT_SOUND_FILE)
-
-_mixer_ready = False
-if pygame is not None:
-    try:
-        pygame.mixer.init()
-        _mixer_ready = True
-    except Exception as e:
-        print(f"[audio] Could not initialize pygame mixer: {e}")
 
 
-def play_perfect_sound():
+def play_sound(sound_filename):
     """
-    Play PERFECT_SOUND_FILE via pygame.mixer. Playback is non-blocking by
-    nature (mixer.music.play() returns immediately), so it never freezes the
-    camera loop. Safe to call even if pygame or the mp3 file isn't available -
-    it just logs and skips.
+    Tries several playback backends in order, printing exactly which one is
+    attempted and what happens, so it's easy to see in the console which
+    method (if any) actually works on this machine:
+
+        1. pygame.mixer   - preferred, cross-platform, non-blocking, and the
+                             only one stop_sound() can actually stop early
+        2. playsound      - simpler fallback, some platforms need extra libs
+        3. os.startfile   - Windows only; opens the file in its default app
+                            (e.g. Windows Media Player / browser) as a last
+                            resort, since that almost always produces sound
+                            even when audio libraries are misconfigured.
+                            NOTE: playback via this path cannot be stopped
+                            from Python, and if that app's own repeat/loop
+                            setting is on, it'll keep looping until closed.
     """
-    if pygame is None:
-        print("[audio] 'pygame' package not installed - run `pip install pygame` "
-              "to enable the perfect-coverage sound.")
+    path = os.path.join(_SCRIPT_DIR, sound_filename)
+
+    if not os.path.exists(path):
+        print(f"[audio] '{sound_filename}' not found at {path} - skipping sound.")
         return
 
-    if not _mixer_ready:
-        print("[audio] pygame mixer failed to initialize - check your audio device/drivers.")
-        return
-
-    if not os.path.exists(_PERFECT_SOUND_PATH):
-        print(f"[audio] '{PERFECT_SOUND_FILE}' not found at {_PERFECT_SOUND_PATH} - skipping sound.")
-        return
-
+    # --- 1. pygame ---
     try:
-        # Only restart playback if it isn't already playing this sound, so
-        # rapid re-triggers don't stutter/cut themselves off.
+        import pygame
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
         if not pygame.mixer.music.get_busy():
-            pygame.mixer.music.load(_PERFECT_SOUND_PATH)
+            pygame.mixer.music.load(path)
             pygame.mixer.music.play()
+        print(f"[audio] Played '{sound_filename}' via pygame.")
+        return
     except Exception as e:
-        print(f"[audio] Failed to play {PERFECT_SOUND_FILE}: {e}")
+        print(f"[audio] pygame playback of '{sound_filename}' failed ({e}); trying playsound...")
+
+    # --- 2. playsound ---
+    try:
+        from playsound import playsound
+        import threading
+        threading.Thread(target=playsound, args=(path,), daemon=True).start()
+        print(f"[audio] Played '{sound_filename}' via playsound.")
+        return
+    except Exception as e:
+        print(f"[audio] playsound playback of '{sound_filename}' failed ({e}); trying os.startfile...")
+
+    # --- 3. os.startfile (Windows only, opens default app) ---
+    try:
+        os.startfile(path)
+        print(f"[audio] Opened '{sound_filename}' via os.startfile (default app).")
+        return
+    except Exception as e:
+        print(f"[audio] os.startfile failed for '{sound_filename}' ({e}). No playback method worked.")
+
+
+def stop_sound():
+    """
+    Stop whatever tier sound is currently playing via pygame, so pressing
+    SPACE for the next capture immediately cuts off the previous one. Safe to
+    call even if pygame was never used/initialized - it just does nothing.
+    (If playback fell back to os.startfile, it opened a separate media player
+    app and can't be stopped from here.)
+    """
+    try:
+        import pygame
+        if pygame.mixer.get_init():
+            pygame.mixer.music.stop()
+    except Exception:
+        pass
 
 
 # =============================================================================
-# COVERAGE-TIER RATING IMAGE
+# COVERAGE-TIER RATING IMAGE + SOUND
 # =============================================================================
 
 def get_tier_image_filename(coverage_pct):
@@ -154,20 +194,180 @@ def get_tier_image_filename(coverage_pct):
 
 
 def show_tier_image(coverage_pct):
-    """Load and display the rating image that matches this coverage tier."""
+    """Load and display the rating image that matches this coverage tier,
+    scaled to fill the screen without cropping or distorting it, and play
+    that tier's sound once alongside it."""
     filename = get_tier_image_filename(coverage_pct)
     path = os.path.join(_SCRIPT_DIR, filename)
 
     if not os.path.exists(path):
         print(f"[image] '{filename}' not found at {path} - skipping rating image.")
+    else:
+        img = cv2.imread(path)
+        if img is None:
+            print(f"[image] Could not read '{filename}' - is it a valid image file?")
+        else:
+            cv2.namedWindow("Rating", cv2.WND_PROP_FULLSCREEN)
+            cv2.setWindowProperty("Rating", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+            # Figure out the actual fullscreen window size (varies per
+            # monitor), then letterbox the image into it so the whole thing
+            # is visible - no cropping, no stretching, just black bars on
+            # whichever side doesn't match.
+            screen_w, screen_h = _get_screen_resolution()
+            fitted = _letterbox_to_size(img, screen_w, screen_h)
+            cv2.imshow("Rating", fitted)
+
+    sound_filename = TIER_SOUNDS.get(filename)
+    if sound_filename:
+        play_sound(sound_filename)
+
+
+def _get_screen_resolution():
+    """Best-effort screen size lookup; falls back to a common 1080p size."""
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        w, h = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.destroy()
+        return w, h
+    except Exception:
+        return 1920, 1080
+
+
+def _letterbox_to_size(img, target_w, target_h):
+    """Resize `img` to fit within target_w x target_h, preserving aspect
+    ratio, and pad the leftover space with black bars so the full image is
+    always visible (no cropping) and never distorted."""
+    h, w = img.shape[:2]
+    scale = min(target_w / w, target_h / h)
+    new_w, new_h = int(w * scale), int(h * scale)
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    x_off = (target_w - new_w) // 2
+    y_off = (target_h - new_h) // 2
+    canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+    return canvas
+
+
+# =============================================================================
+# INTRO VIDEO (plays once before the home screen)
+# =============================================================================
+
+def play_intro_video():
+    """
+    Plays INTRO_VIDEO_FILE fullscreen, frame by frame, until it ends or the
+    user skips it (SPACE, ESC, ENTER, or Q). Note: OpenCV only renders video
+    frames - it does not play the audio track. If intro.mp4 has sound you
+    want to hear, it needs to be played through a separate audio pipeline
+    (e.g. muxed at capture time, or played alongside via pygame with the
+    audio extracted to its own file).
+    """
+    path = os.path.join(_SCRIPT_DIR, INTRO_VIDEO_FILE)
+    if not os.path.exists(path):
+        print(f"[intro] '{INTRO_VIDEO_FILE}' not found at {path} - skipping intro.")
         return
 
-    img = cv2.imread(path)
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        print(f"[intro] Could not open '{INTRO_VIDEO_FILE}' - skipping intro.")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0:
+        fps = 30.0
+    delay_ms = max(1, int(1000 / fps))
+
+    screen_w, screen_h = _get_screen_resolution()
+
+    cv2.namedWindow("Intro", cv2.WND_PROP_FULLSCREEN)
+    cv2.setWindowProperty("Intro", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    print("[intro] Playing intro.mp4 - press SPACE/ENTER/ESC/Q to skip.")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break  # video finished naturally
+
+        fitted = _letterbox_to_size(frame, screen_w, screen_h)
+        cv2.imshow("Intro", fitted)
+
+        key = cv2.waitKey(delay_ms) & 0xFF
+        if key in (27, 13, ord(' '), ord('q'), ord('Q')):  # ESC, ENTER, SPACE, Q
+            break
+
+    cap.release()
+    cv2.destroyWindow("Intro")
+
+
+# =============================================================================
+# HOME SCREEN (title button gates entry into capture/retake/customize)
+# =============================================================================
+
+def build_home_screen(screen_w, screen_h):
+    """
+    Build the fullscreen home image (10.png, letterboxed) with a clickable
+    title button drawn on top. Returns (canvas, button_rect) where
+    button_rect = (x, y, w, h) in canvas pixel coordinates - used later to
+    test whether a click landed on the title.
+    """
+    path = os.path.join(_SCRIPT_DIR, HOME_IMAGE_FILE)
+
+    if os.path.exists(path):
+        img = cv2.imread(path)
+    else:
+        img = None
+        print(f"[home] '{HOME_IMAGE_FILE}' not found at {path} - using a black background instead.")
+
     if img is None:
-        print(f"[image] Could not read '{filename}' - is it a valid image file?")
-        return
+        canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+    else:
+        canvas = _letterbox_to_size(img, screen_w, screen_h)
 
-    cv2.imshow("Rating", img)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 1.4
+    thickness = 3
+    (text_w, text_h), _ = cv2.getTextSize(HOME_TITLE_TEXT, font, scale, thickness)
+
+    pad_x, pad_y = 45, 28
+    btn_w = text_w + 2 * pad_x
+    btn_h = text_h + 2 * pad_y
+    btn_x = (screen_w - btn_w) // 2
+    btn_y = int(screen_h * 0.78) - btn_h // 2  # sits about 3/4 down the screen
+
+    # Semi-transparent dark button behind the title, so it reads clearly over
+    # any part of the background image.
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (btn_x, btn_y), (btn_x + btn_w, btn_y + btn_h), (30, 30, 30), -1)
+    canvas = cv2.addWeighted(overlay, 0.65, canvas, 0.35, 0)
+    cv2.rectangle(canvas, (btn_x, btn_y), (btn_x + btn_w, btn_y + btn_h), (255, 255, 255), 2)
+
+    text_x = btn_x + pad_x
+    text_y = btn_y + pad_y + text_h
+    cv2.putText(canvas, HOME_TITLE_TEXT, (text_x, text_y), font, scale,
+                (255, 255, 255), thickness, cv2.LINE_AA)
+
+    return canvas, (btn_x, btn_y, btn_w, btn_h)
+
+
+def point_in_rect(x, y, rect):
+    rx, ry, rw, rh = rect
+    return rx <= x <= rx + rw and ry <= y <= ry + rh
+
+
+def make_home_click_callback(button_rect, click_state):
+    """
+    Returns an OpenCV mouse callback that sets click_state["clicked"] = True
+    only when a left-click lands inside button_rect (the title button) -
+    clicks anywhere else on the home screen do nothing.
+    """
+    def on_mouse(event, x, y, flags, userdata):
+        if event == cv2.EVENT_LBUTTONDOWN and point_in_rect(x, y, button_rect):
+            click_state["clicked"] = True
+    return on_mouse
 
 
 # =============================================================================
@@ -278,10 +478,8 @@ def analyze_and_show(frame, config):
     coverage_pct = 100.0 * chocolate_pixels / total_pixels if total_pixels else 0.0
     uniformity_pct = compute_uniformity(mask, UNIFORMITY_GRID)
 
-    is_perfect = coverage_pct >= PERFECT_COVERAGE_THRESHOLD
-    if is_perfect:
-        play_perfect_sound()
-
+    # Shows the tier rating image (1/2/3.png) AND plays that tier's sound
+    # (bad/mid/perfect.mp3) once, based on coverage_pct.
     show_tier_image(coverage_pct)
 
     # --- Build the overlay: highlight detected chocolate in semi-transparent red ---
@@ -303,12 +501,8 @@ def analyze_and_show(frame, config):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(panel, f"Uniformity (experimental): {uniformity_pct:.1f}%", (15, 155),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
-    if is_perfect:
-        cv2.putText(panel, "PERFECT COVERAGE!", (15, 185),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-    else:
-        cv2.putText(panel, "Press R to go back live, Q to quit", (15, 195),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1, cv2.LINE_AA)
+    cv2.putText(panel, "Press R to go back live, Q to quit", (15, 195),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1, cv2.LINE_AA)
 
     cv2.imshow("Original (Captured)", original_annotated)
     cv2.imshow("Chocolate Mask", mask)
@@ -319,8 +513,6 @@ def analyze_and_show(frame, config):
     print(f"Chocolate pixels: {chocolate_pixels:,}")
     print(f"Total bread-area pixels: {total_pixels:,}")
     print(f"Uniformity (experimental): {uniformity_pct:.1f}%")
-    if is_perfect:
-        print(f"[audio] Coverage >= {PERFECT_COVERAGE_THRESHOLD:.0f}% - playing {PERFECT_SOUND_FILE}")
 
 
 def close_result_windows():
@@ -478,7 +670,33 @@ def main():
         return
 
     print("\n=== Hershey's Chocolate Spread Coverage Detector ===")
+
+    # --- INTRO VIDEO: plays once, before anything else ---
+    play_intro_video()
+
+    print("Click the title on the home screen to begin.")
     print("SPACE = capture & analyze | R = back to live | C = calibrate | Q = quit\n")
+
+    # --- HOME SCREEN: nothing else opens until the title button is clicked ---
+    screen_w, screen_h = _get_screen_resolution()
+    home_img, button_rect = build_home_screen(screen_w, screen_h)
+    home_click_state = {"clicked": False}
+
+    cv2.namedWindow("Home", cv2.WND_PROP_FULLSCREEN)
+    cv2.setWindowProperty("Home", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    cv2.setMouseCallback("Home", make_home_click_callback(button_rect, home_click_state))
+
+    while True:
+        cv2.imshow("Home", home_img)
+        key = cv2.waitKey(20) & 0xFF
+        if home_click_state["clicked"]:
+            break
+        if key in (ord('q'), ord('Q')):
+            cap.release()
+            cv2.destroyAllWindows()
+            return
+
+    cv2.destroyWindow("Home")
 
     state = "LIVE"
 
@@ -499,6 +717,9 @@ def main():
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord(' '):
+                # Stop whatever tier sound is still playing from the last
+                # capture before starting the next one.
+                stop_sound()
                 analyze_and_show(frame, config)
                 state = "RESULT"
             elif key in (ord('c'), ord('C')):
@@ -517,6 +738,7 @@ def main():
         elif state == "RESULT":
             key = cv2.waitKey(0) & 0xFF
             if key in (ord('r'), ord('R')):
+                stop_sound()
                 close_result_windows()
                 state = "LIVE"
             elif key in (ord('q'), ord('Q')):
