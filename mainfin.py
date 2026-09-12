@@ -65,6 +65,10 @@ TIER_IMAGES = [
     (0.0, "3.png"),    # 0-49.999...%
 ]
 
+# --- Home screen ---
+HOME_IMAGE_FILE = "10.png"
+HOME_TITLE_TEXT = "CHECK YOUR SPREAD"
+
 # =============================================================================
 # CONFIG PERSISTENCE
 # =============================================================================
@@ -207,6 +211,73 @@ def _letterbox_to_size(img, target_w, target_h):
     y_off = (target_h - new_h) // 2
     canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
     return canvas
+
+
+# =============================================================================
+# HOME SCREEN (title button gates entry into capture/retake/customize)
+# =============================================================================
+
+def build_home_screen(screen_w, screen_h):
+    """
+    Build the fullscreen home image (10.png, letterboxed) with a clickable
+    title button drawn on top. Returns (canvas, button_rect) where
+    button_rect = (x, y, w, h) in canvas pixel coordinates - used later to
+    test whether a click landed on the title.
+    """
+    path = os.path.join(_SCRIPT_DIR, HOME_IMAGE_FILE)
+
+    if os.path.exists(path):
+        img = cv2.imread(path)
+    else:
+        img = None
+        print(f"[home] '{HOME_IMAGE_FILE}' not found at {path} - using a black background instead.")
+
+    if img is None:
+        canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+    else:
+        canvas = _letterbox_to_size(img, screen_w, screen_h)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 1.4
+    thickness = 3
+    (text_w, text_h), _ = cv2.getTextSize(HOME_TITLE_TEXT, font, scale, thickness)
+
+    pad_x, pad_y = 45, 28
+    btn_w = text_w + 2 * pad_x
+    btn_h = text_h + 2 * pad_y
+    btn_x = (screen_w - btn_w) // 2
+    btn_y = int(screen_h * 0.78) - btn_h // 2  # sits about 3/4 down the screen
+
+    # Semi-transparent dark button behind the title, so it reads clearly over
+    # any part of the background image.
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (btn_x, btn_y), (btn_x + btn_w, btn_y + btn_h), (30, 30, 30), -1)
+    canvas = cv2.addWeighted(overlay, 0.65, canvas, 0.35, 0)
+    cv2.rectangle(canvas, (btn_x, btn_y), (btn_x + btn_w, btn_y + btn_h), (255, 255, 255), 2)
+
+    text_x = btn_x + pad_x
+    text_y = btn_y + pad_y + text_h
+    cv2.putText(canvas, HOME_TITLE_TEXT, (text_x, text_y), font, scale,
+                (255, 255, 255), thickness, cv2.LINE_AA)
+
+    return canvas, (btn_x, btn_y, btn_w, btn_h)
+
+
+def point_in_rect(x, y, rect):
+    rx, ry, rw, rh = rect
+    return rx <= x <= rx + rw and ry <= y <= ry + rh
+
+
+def make_home_click_callback(button_rect, click_state):
+    """
+    Returns an OpenCV mouse callback that sets click_state["clicked"] = True
+    only when a left-click lands inside button_rect (the title button) -
+    clicks anywhere else on the home screen do nothing.
+    """
+    def on_mouse(event, x, y, flags, userdata):
+        if event == cv2.EVENT_LBUTTONDOWN and point_in_rect(x, y, button_rect):
+            click_state["clicked"] = True
+    return on_mouse
 
 
 # =============================================================================
@@ -517,7 +588,29 @@ def main():
         return
 
     print("\n=== Hershey's Chocolate Spread Coverage Detector ===")
+    print("Click the title on the home screen to begin.")
     print("SPACE = capture & analyze | R = back to live | C = calibrate | Q = quit\n")
+
+    # --- HOME SCREEN: nothing else opens until the title button is clicked ---
+    screen_w, screen_h = _get_screen_resolution()
+    home_img, button_rect = build_home_screen(screen_w, screen_h)
+    home_click_state = {"clicked": False}
+
+    cv2.namedWindow("Home", cv2.WND_PROP_FULLSCREEN)
+    cv2.setWindowProperty("Home", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    cv2.setMouseCallback("Home", make_home_click_callback(button_rect, home_click_state))
+
+    while True:
+        cv2.imshow("Home", home_img)
+        key = cv2.waitKey(20) & 0xFF
+        if home_click_state["clicked"]:
+            break
+        if key in (ord('q'), ord('Q')):
+            cap.release()
+            cv2.destroyAllWindows()
+            return
+
+    cv2.destroyWindow("Home")
 
     state = "LIVE"
 
